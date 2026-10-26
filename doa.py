@@ -27,9 +27,8 @@ class DownloaderApp(ctk.CTk):
 
         self.title("Driver Loader")
 
-        # --- Окно: больше по размеру и по центру экрана ---
-        win_w, win_h = 720, 800
-        self.minsize(640, 680)
+        win_w, win_h = 720, 820
+        self.minsize(640, 700)
         self.attributes("-alpha", 0.97)
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
@@ -55,6 +54,7 @@ class DownloaderApp(ctk.CTk):
 
         self.token = os.environ.get("GITHUB_TOKEN", "")
         self.username_var = ctk.StringVar(value="")
+        self.include_prerelease = ctk.BooleanVar(value=True)  # по умолчанию качаем и пре-релизы
         self.repo_checkboxes = {}
 
         # ===== Верхняя карточка =====
@@ -82,14 +82,14 @@ class DownloaderApp(ctk.CTk):
 
         ctk.CTkLabel(top, text="Шаблон файла",
                      font=("Segoe UI", 12), text_color=TEXT_SUB
-                     ).grid(row=1, column=0, padx=(16, 8), pady=(4, 6), sticky="w")
+                     ).grid(row=1, column=0, padx=(16, 8), pady=(4, 4), sticky="w")
 
         self.pattern_entry = ctk.CTkEntry(
             top, width=260, fg_color="#1a0f2e",
             border_color=ACCENT, text_color=TEXT_MAIN
         )
         self.pattern_entry.insert(0, "*.exe")
-        self.pattern_entry.grid(row=1, column=1, padx=(0, 8), pady=(4, 6), sticky="w")
+        self.pattern_entry.grid(row=1, column=1, padx=(0, 8), pady=(4, 4), sticky="w")
 
         self.load_json_btn = ctk.CTkButton(
             top, text="Загрузить projects.json", width=160,
@@ -97,7 +97,19 @@ class DownloaderApp(ctk.CTk):
             text_color=TEXT_SUB, border_width=1, border_color=ACCENT,
             command=self.load_projects_json
         )
-        self.load_json_btn.grid(row=1, column=2, padx=(0, 16), pady=(4, 6))
+        self.load_json_btn.grid(row=1, column=2, padx=(0, 16), pady=(4, 4))
+
+        # Чекбокс «Включать пре-релизы»
+        self.prerelease_cb = ctk.CTkCheckBox(
+            top, text="Включать пре-релизы (beta, rc, alpha)",
+            variable=self.include_prerelease,
+            font=("Segoe UI", 12),
+            text_color=TEXT_MAIN,
+            text_color_disabled="#8a7fa8",
+            fg_color=ACCENT, hover_color=ACCENT_HOVER, border_color=ACCENT
+        )
+        self.prerelease_cb.grid(row=2, column=0, columnspan=3,
+                                padx=16, pady=(4, 12), sticky="w")
 
         # ===== Список проектов =====
         mid = ctk.CTkFrame(self, corner_radius=16, fg_color=BG_CARD,
@@ -154,7 +166,6 @@ class DownloaderApp(ctk.CTk):
         self.download_btn.grid(row=1, column=0, columnspan=3,
                                padx=16, pady=(4, 8), sticky="ew")
 
-        # Лог стал ниже, чтобы всё влезло в окно
         self.log_box = ctk.CTkTextbox(
             bottom, height=90, corner_radius=10,
             fg_color="#1a0f2e", text_color=TEXT_MAIN,
@@ -312,15 +323,16 @@ class DownloaderApp(ctk.CTk):
             return
         global_pattern = self.pattern_entry.get().strip() or "*"
         out_dir = self.download_dir_var.get().strip()
+        include_pre = self.include_prerelease.get()
 
         self.download_btn.configure(state="disabled", text="Скачивание...")
         threading.Thread(
             target=self._download_all,
-            args=(selected, global_pattern, out_dir),
+            args=(selected, global_pattern, out_dir, include_pre),
             daemon=True
         ).start()
 
-    def _download_all(self, selected, global_pattern, out_dir):
+    def _download_all(self, selected, global_pattern, out_dir, include_pre):
         try:
             os.makedirs(out_dir, exist_ok=True)
         except Exception as e:
@@ -331,36 +343,63 @@ class DownloaderApp(ctk.CTk):
 
         for name, owner, default_pattern in selected:
             pattern = default_pattern or global_pattern
-            self._process_repo(owner, name, pattern, out_dir)
+            self._process_repo(owner, name, pattern, out_dir, include_pre)
 
         self.after(0, lambda: self.log("\n🏁 Готово"))
         self.after(0, lambda: self.download_btn.configure(
             state="normal", text="⬇ Скачать выбранное"))
 
-    # ---------- Обработка одного репозитория ----------
-    def _process_repo(self, owner, repo, pattern, out_dir):
+    # ---------- Обработка одного репозитория (с поддержкой пре-релизов) ----------
+    def _process_repo(self, owner, repo, pattern, out_dir, include_pre=True):
         self.after(0, lambda: self.log(f"\n📦 {owner}/{repo}"))
         try:
-            url = f"{GITHUB_API}/repos/{owner}/{repo}/releases/latest"
+            # Запрашиваем СПИСОК релизов, а не latest — так видны и пре-релизы
+            url = f"{GITHUB_API}/repos/{owner}/{repo}/releases?per_page=30"
             r = requests.get(url, headers=self.headers(), timeout=15)
             if r.status_code == 404:
-                self.after(0, lambda: self.log("  — релизов нет, пропускаем"))
+                self.after(0, lambda: self.log(
+                    f"  ❌ Репозиторий или релизы не найдены (404): {owner}/{repo}"))
+                return
+            if r.status_code == 403:
+                self.after(0, lambda: self.log(
+                    "  ❌ Доступ запрещён (403). Приватный репозиторий? Токену нужен scope 'repo'."))
                 return
             r.raise_for_status()
-            release = r.json()
+            releases = r.json()
         except Exception as e:
-            self.after(0, lambda: self.log(f"  ❌ Ошибка получения релиза: {e}"))
+            self.after(0, lambda e=e: self.log(f"  ❌ Ошибка получения релизов: {e}"))
             return
 
+        if not releases:
+            self.after(0, lambda: self.log("  — релизов нет, пропускаем"))
+            return
+
+        # Фильтруем пре-релизы, если пользователь их не хочет
+        if not include_pre:
+            releases = [rel for rel in releases if not rel.get("prerelease")]
+            if not releases:
+                self.after(0, lambda: self.log(
+                    "  — только пре-релизы, а они отключены в настройках"))
+                return
+
+        # Берём самый свежий подходящий релиз (первый в списке)
+        release = releases[0]
         tag = release.get("tag_name", "?")
+        is_pre = release.get("prerelease", False)
+        label = "пре-релиз" if is_pre else "релиз"
+        self.after(0, lambda t=tag, l=label: self.log(f"  → выбран {l} {t}"))
+
         assets = release.get("assets", [])
         if not assets:
-            self.after(0, lambda: self.log(f"  — в релизе {tag} нет файлов"))
+            self.after(0, lambda t=tag: self.log(
+                f"  — в релизе {t} нет прикреплённых файлов"))
             return
 
         targets = [a for a in assets if fnmatch.fnmatch(a["name"], pattern)]
         if not targets:
-            self.after(0, lambda: self.log(f"  — нет файлов под шаблон '{pattern}'"))
+            names = ", ".join(a["name"] for a in assets)
+            self.after(0, lambda n=names, p=pattern: self.log(
+                f"  — нет файлов под шаблон '{p}'. В релизе есть: {n}"))
             return
 
         repo_dir = os.path.join(out_dir, repo)
